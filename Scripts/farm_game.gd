@@ -4,9 +4,24 @@ const PLAYER_SCENE = preload("res://Scenes/characters/playerA/player.tscn")
 const TILE := 32
 const FARM_COLS := 4
 const FARM_ROWS := 3
+const DISASTER_INTERVAL := 10      # a storm can hit every 10th day
+const LEMON_PRICE := 15
+const CLOCK_SPEED := 2.0           # game minutes per real second
+# House (outside): solid building, door is at the bottom centre
+const HOUSE_DOOR := Vector2(143, 146)
+const HOUSE_EXIT_POS := Vector2(143, 174)
+# House (inside)
+const INTERIOR_SPAWN := Vector2(320, 275)
+const BED_POS := Vector2(410, 240)
+const BED_WAKE := Vector2(396, 252)
+const INTERIOR_DOOR := Vector2(320, 316)
 
 var player: CharacterBody2D
 var camera: Camera2D
+var dig_sound := AudioStreamPlayer.new()
+var harvest_sound := AudioStreamPlayer.new()
+var water_sound := AudioStreamPlayer.new()
+var ambient_sound := AudioStreamPlayer.new()
 var crops := {}
 var tilled := {}
 var day := 1
@@ -14,7 +29,19 @@ var time_minutes := 8 * 60
 var day_seconds := 0.0
 var clock_accumulator := 0.0
 var selected_tool := "Hoe"
-var inventory := {"Seeds": 8, "Lemons": 0, "Coins": 25}
+var inventory := {"Seeds": 8, "Lemons": 0, "Damaged": 0, "Coins": 25}
+var inside := false
+var transitioning := false
+var rain_today := false
+var banner_timer := 0.0
+var banner_panel: PanelContainer
+var banner_title: Label
+var banner_body: Label
+var fade_rect: ColorRect
+var damaged_label: Label
+var pending_banner_title := ""
+var pending_banner_body := ""
+var pending_banner_color := Color(0.72, 0.58, 0.35)
 var intro_step := 0
 var intro_active := true
 var message := ""
@@ -39,6 +66,20 @@ const STORY := [
 ]
 
 func _ready() -> void:
+	dig_sound.stream = load("res://Audio/dig.mp3")
+	harvest_sound.stream = load("res://Audio/harvest.mp3")
+	water_sound.stream = load("res://Audio/wateringcan.mp3")
+	add_child(dig_sound)
+	add_child(harvest_sound)
+	add_child(water_sound)
+	# Background nature noise: loops forever, starts immediately.
+	var ambient := load("res://Audio/nature_ambient.mp3") as AudioStreamMP3
+	if ambient:
+		ambient.loop = true
+		ambient_sound.stream = ambient
+		ambient_sound.volume_db = -8.0
+		add_child(ambient_sound)
+		ambient_sound.play()
 	_build_world()
 	_build_ui()
 	_show_intro()
@@ -58,6 +99,15 @@ func _build_world() -> void:
 	player.add_child(camera)
 	camera.position = Vector2.ZERO
 	camera.enabled = true
+	# Make the house solid so you have to use the door.
+	var house_body := StaticBody2D.new()
+	var house_shape := CollisionShape2D.new()
+	var house_rect := RectangleShape2D.new()
+	house_rect.size = Vector2(157, 98)
+	house_shape.shape = house_rect
+	house_shape.position = Vector2(142.5, 101)
+	house_body.add_child(house_shape)
+	add_child(house_body)
 
 func _build_ui() -> void:
 	canvas = CanvasLayer.new()
@@ -100,6 +150,8 @@ func _build_ui() -> void:
 	root.add_child(hud_label)
 	_build_hotbar(root)
 	_build_inventory_corner(root)
+	_build_banner(root)
+	_build_fade()
 	hint_label = Label.new()
 	hint_label.position = Vector2(12, 300)
 	hint_label.add_theme_font_size_override("font_size", 13)
@@ -107,6 +159,7 @@ func _build_ui() -> void:
 	_update_ui()
 
 func _show_intro() -> void:
+	player.call("set_frozen", true)
 	panel.visible = true
 	_update_story()
 
@@ -122,8 +175,16 @@ func _input(event: InputEvent) -> void:
 				panel.visible = false
 				message = "Welcome home! Start by tilling a plot."
 				message_timer = 4.0
+				player.call("set_frozen", false)
+				_show_banner("Day 1 - A New Start", "Till the soil, plant your lemon seeds and keep an eye on the weather. Every %d days a storm can hit while you sleep: rain doubles your harvest, wind damages ripe lemons so they sell for half. Walk up to your house and press E to go inside and sleep." % DISASTER_INTERVAL, Color(0.72, 0.58, 0.35))
 			else:
 				_update_story()
+		return
+	if transitioning:
+		return
+	if banner_panel.visible and event.is_action_pressed("ui_accept"):
+		banner_panel.visible = false
+		banner_timer = 0.0
 		return
 	if event.is_action_pressed("tool_hoe"):
 		selected_tool = "Hoe"
@@ -136,16 +197,27 @@ func _input(event: InputEvent) -> void:
 	elif event.is_action_pressed("interact"):
 		_use_tool()
 	elif event.is_action_pressed("sleep"):
-		_sleep()
+		_try_sleep()
 	_update_ui()
 
 func _process(delta: float) -> void:
 	if intro_active:
 		return
-	day_seconds += delta
-	time_minutes += int(delta * 2.0)
-	if time_minutes >= 24 * 60:
-		_sleep()
+	if not transitioning:
+		day_seconds += delta
+		clock_accumulator += delta * CLOCK_SPEED
+		var whole := int(clock_accumulator)
+		if whole > 0:
+			time_minutes += whole
+			clock_accumulator -= whole
+		if time_minutes >= 24 * 60:
+			_begin_sleep(true)   # collapse at midnight
+	if inside and not transitioning:
+		player.position = player.position.clamp(Vector2(188, 214), Vector2(452, 318))
+	if banner_timer > 0.0:
+		banner_timer -= delta
+		if banner_timer <= 0.0:
+			banner_panel.visible = false
 	crop_timer += delta
 	if crop_timer >= 1.0:
 		crop_timer = 0
@@ -153,12 +225,19 @@ func _process(delta: float) -> void:
 			if crops[key]["watered"] and crops[key]["stage"] < 3:
 				crops[key]["stage"] += 1
 				crops[key]["watered"] = false
+		queue_redraw()
 		_update_ui()
 	if message_timer > 0:
 		message_timer -= delta
 	_update_ui()
 
 func _use_tool() -> void:
+	if inside:
+		_use_inside()
+		return
+	if _near_house_door():
+		_transition(_enter_house, 0.25)
+		return
 	if _near_market():
 		_handle_market()
 		_update_ui()
@@ -173,6 +252,7 @@ func _use_tool() -> void:
 				_show_message("A crop is growing here!")
 			else:
 				tilled[key] = true
+				dig_sound.play()
 				_show_message("Soil tilled. Switch to Seeds to plant.")
 		"Seeds":
 			if not tilled.has(key):
@@ -182,20 +262,33 @@ func _use_tool() -> void:
 			elif inventory["Seeds"] <= 0:
 				_show_message("Out of lemon seeds! Buy more at the market.")
 			else:
-				crops[key] = {"stage": 0, "watered": false}
+				crops[key] = {"stage": 0, "watered": false, "damaged": false}
 				inventory["Seeds"] -= 1
 				_show_message("Lemon seed planted. Water it!")
 		"Water":
 			if crops.has(key) and crops[key]["stage"] < 3:
 				crops[key]["watered"] = true
+				water_sound.play()
 				_show_message("Watered! It will grow with time.")
 			else:
 				_show_message("Plant a seed first.")
 		"Harvest":
 			if crops.has(key) and crops[key]["stage"] >= 3:
+				var was_damaged: bool = crops[key].get("damaged", false)
+				var amount := 2 if rain_today else 1
 				crops.erase(key)
-				inventory["Lemons"] += 1
-				_show_message("Harvested a lemon! Sell it at the market.")
+				tilled.erase(key)  # harvested square goes back to untilled dirt
+				if was_damaged:
+					inventory["Damaged"] += amount
+				else:
+					inventory["Lemons"] += amount
+				harvest_sound.play()
+				var text := "Harvested %d lemon%s!" % [amount, "s" if amount > 1 else ""]
+				if rain_today:
+					text += " (Rain bonus x2)"
+				if was_damaged:
+					text += " Wind-damaged: sells for half."
+				_show_message(text + " Re-till the soil to plant again.")
 			else:
 				_show_message("This crop isn't ready yet.")
 	_update_ui()
@@ -214,15 +307,61 @@ func _nearest_plot() -> String:
 				best = key
 	return best if best_dist < 46 else ""
 
-func _sleep() -> void:
+func _sleep(passed_out := false) -> void:
 	day += 1
 	time_minutes = 6 * 60
+	clock_accumulator = 0.0
 	day_seconds = 0
+	rain_today = false
+	# Every DISASTER_INTERVAL days a storm hits in the night: rain or wind.
+	var event := ""
+	if day % DISASTER_INTERVAL == 0:
+		event = "rain" if randi() % 2 == 0 else "wind"
+	if event == "rain":
+		for key in crops.keys():
+			if crops[key]["stage"] < 3:
+				crops[key]["watered"] = true
+		rain_today = true
+	var grew := 0
 	for key in crops.keys():
 		if crops[key]["watered"] and crops[key]["stage"] < 3:
 			crops[key]["stage"] += 1
+			grew += 1
 		crops[key]["watered"] = false
-	_show_message("A new day begins. Crops watered overnight grew!")
+	var hurt := 0
+	if event == "wind":
+		for key in crops.keys():
+			if crops[key]["stage"] >= 3 and not crops[key].get("damaged", false):
+				crops[key]["damaged"] = true
+				hurt += 1
+	# Build the morning banner
+	var title := "Day %d" % day
+	var body := ""
+	var color := Color(0.72, 0.58, 0.35)
+	if passed_out:
+		body += "You collapsed from exhaustion at midnight and woke up in bed. "
+	match event:
+		"rain":
+			title = "Day %d - Heavy Rain!" % day
+			color = Color(0.35, 0.65, 0.9)
+			body += "A storm rolled in while you slept and watered every crop. All lemon harvests are DOUBLED today!"
+		"wind":
+			title = "Day %d - Fierce Wind!" % day
+			color = Color(0.75, 0.38, 0.33)
+			if hurt > 0:
+				body += "Strong winds battered the farm in the night. %d ripe lemon plot%s damaged - those lemons will only sell for half price." % [hurt, "s were" if hurt > 1 else " was"]
+			else:
+				body += "Strong winds howled through the night, but luckily no ripe lemons were on the vines."
+		_:
+			body += "A calm, quiet night."
+	if grew > 0:
+		body += " %d crop%s grew overnight." % [grew, "s" if grew > 1 else ""]
+	elif crops.size() > 0 and event == "":
+		body += " Nothing grew - remember to water your crops before bed."
+	pending_banner_title = title
+	pending_banner_body = body.strip_edges()
+	pending_banner_color = color
+	queue_redraw()
 
 func _show_message(text: String) -> void:
 	message = text
@@ -238,16 +377,26 @@ func _update_ui() -> void:
 	if display_hour == 0:
 		display_hour = 12
 	hud_label.text = "Day %d  |  %02d:%02d %s" % [day, display_hour, mins, suffix]
+	if rain_today:
+		hud_label.text += "  |  RAIN: harvest x2"
 	money_label.text = "$ %d" % inventory["Coins"]
 	seeds_label.text = "🌱 %d" % inventory["Seeds"]
 	lemons_label.text = "🍋  %d" % inventory["Lemons"]
+	damaged_label.text = "🌪  %d" % inventory["Damaged"]
 	for i in range(hotbar_buttons.size()):
 		hotbar_buttons[i].button_pressed = (i == _selected_tool_index())
 		hotbar_buttons[i].modulate = Color(1.0, 0.9, 0.65) if i == _selected_tool_index() else Color.WHITE
-	var default_hint := "WASD move • E use/interact • F sleep • Near market: 2 buy seeds / 4 sell lemons"
+	var default_hint := "WASD move • E use/interact • F sleep (inside house) • Near market: 2 buy seeds / 4 sell lemons"
+	if inside:
+		default_hint = "E at the bed or F: sleep  •  E at the door: leave the house"
+	elif is_instance_valid(player) and _near_house_door():
+		default_hint = "E: enter your house"
 	hint_label.text = message if message_timer > 0 else default_hint
 
 func _draw() -> void:
+	if inside:
+		_draw_interior()
+		return
 	# Warm, cozy farm ground with pixel-art-like patches and paths.
 	draw_rect(Rect2(0, 0, 640, 480), Color("#76b85b"))
 	for y in range(0, 480, 32):
@@ -281,10 +430,13 @@ func _draw() -> void:
 				var center := r.position + r.size / 2
 				if stage >= 3:
 					# Ripe lemons: bright yellow fruit and small leaves.
-					draw_circle(center + Vector2(-5, 1), 8, Color("#f5d83f"))
-					draw_circle(center + Vector2(6, -4), 7, Color("#f5d83f"))
-					draw_circle(center + Vector2(-7, -2), 3, Color("#ffe978"))
-					draw_circle(center + Vector2(4, -6), 3, Color("#ffe978"))
+					var hurt_lemons: bool = crops[key].get("damaged", false)
+					var lemon_col := Color("#a38f3a") if hurt_lemons else Color("#f5d83f")
+					var shine_col := Color("#bfae62") if hurt_lemons else Color("#ffe978")
+					draw_circle(center + Vector2(-5, 1), 8, lemon_col)
+					draw_circle(center + Vector2(6, -4), 7, lemon_col)
+					draw_circle(center + Vector2(-7, -2), 3, shine_col)
+					draw_circle(center + Vector2(4, -6), 3, shine_col)
 					draw_line(center + Vector2(0, -8), center + Vector2(5, -13), Color("#3f7735"), 3)
 				else:
 					draw_circle(center + Vector2(-5, 1), 5 + stage * 2, c)
@@ -353,7 +505,7 @@ func _build_inventory_corner(root: Control) -> void:
 	stack.anchor_top = 1.0
 	stack.anchor_bottom = 1.0
 	stack.offset_left = -156
-	stack.offset_top = -132
+	stack.offset_top = -172
 	stack.offset_right = -14
 	stack.offset_bottom = -14
 	stack.add_theme_constant_override("separation", 6)
@@ -361,7 +513,8 @@ func _build_inventory_corner(root: Control) -> void:
 	money_label = _inventory_label("$  0")
 	seeds_label = _inventory_label("🌱  0")
 	lemons_label = _inventory_label("🍋  0")
-	for label in [money_label, seeds_label, lemons_label]:
+	damaged_label = _inventory_label("🌪  0")
+	for label in [money_label, seeds_label, lemons_label, damaged_label]:
 		label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 		label.custom_minimum_size = Vector2(128, 30)
 		label.add_theme_font_size_override("font_size", 19)
@@ -415,13 +568,191 @@ func _handle_market() -> void:
 		else:
 			_show_message("Seeds cost $10 for 5. Not enough money!")
 	elif selected_tool == "Harvest":
-		if inventory["Lemons"] > 0:
-			var quantity: int = inventory["Lemons"]
-			var earnings: int = quantity * 15
+		var normal: int = inventory["Lemons"]
+		var damaged: int = inventory["Damaged"]
+		if normal + damaged > 0:
+			var earnings := int(round(normal * LEMON_PRICE + damaged * LEMON_PRICE * 0.5))
 			inventory["Lemons"] = 0
+			inventory["Damaged"] = 0
 			inventory["Coins"] += earnings
-			_show_message("Sold %d lemons for $%d!" % [quantity, earnings])
+			var sold := "Sold %d lemons for $%d!" % [normal + damaged, earnings]
+			if damaged > 0:
+				sold += " (%d wind-damaged at half price)" % damaged
+			_show_message(sold)
 		else:
 			_show_message("No lemons to sell. Harvest ripe lemon crops first.")
 	else:
 		_show_message("Market: 2 buys seeds ($10 for 5), 4 sells lemons ($15 each).")
+
+
+# ---------------------------------------------------------------- house & sleep
+
+func _near_house_door() -> bool:
+	return player.position.distance_to(HOUSE_DOOR) < 40
+
+func _use_inside() -> void:
+	if player.position.distance_to(BED_POS) < 55:
+		_begin_sleep(false)
+	elif player.position.distance_to(INTERIOR_DOOR) < 36:
+		_transition(_exit_house, 0.25)
+	else:
+		_show_message("E at the bed to sleep, or at the door to leave.")
+
+func _try_sleep() -> void:
+	if not inside:
+		_show_message("You can only sleep inside your house. Press E at the front door.")
+	else:
+		_begin_sleep(false)
+
+func _set_camera_limits(in_house: bool) -> void:
+	if in_house:
+		camera.limit_left = 160
+		camera.limit_top = 140
+		camera.limit_right = 480
+		camera.limit_bottom = 340
+	else:
+		camera.limit_left = 0
+		camera.limit_top = 0
+		camera.limit_right = 640
+		camera.limit_bottom = 480
+
+func _enter_house() -> void:
+	inside = true
+	player.position = INTERIOR_SPAWN
+	_set_camera_limits(true)
+	queue_redraw()
+
+func _exit_house() -> void:
+	inside = false
+	player.position = HOUSE_EXIT_POS
+	_set_camera_limits(false)
+	queue_redraw()
+
+func _begin_sleep(passed_out: bool) -> void:
+	_transition(_do_sleep.bind(passed_out), 0.8, 1.2, _show_pending_banner)
+
+func _do_sleep(passed_out: bool) -> void:
+	if not inside:
+		inside = true
+		_set_camera_limits(true)
+	player.position = BED_WAKE
+	_sleep(passed_out)
+
+func _show_pending_banner() -> void:
+	_show_banner(pending_banner_title, pending_banner_body, pending_banner_color)
+
+# Fade to black, run `mid` while the screen is dark, fade back in, then run `after`.
+func _transition(mid: Callable, fade_time := 0.3, hold := 0.0, after := Callable()) -> void:
+	if transitioning:
+		return
+	transitioning = true
+	player.call("set_frozen", true)
+	var tw := create_tween()
+	tw.tween_property(fade_rect, "color:a", 1.0, fade_time)
+	tw.tween_callback(mid)
+	if hold > 0.0:
+		tw.tween_interval(hold)
+	tw.tween_property(fade_rect, "color:a", 0.0, fade_time)
+	tw.tween_callback(_end_transition.bind(after))
+
+func _end_transition(after: Callable) -> void:
+	transitioning = false
+	if not intro_active:
+		player.call("set_frozen", false)
+	if after.is_valid():
+		after.call()
+
+func _build_fade() -> void:
+	var fade_layer := CanvasLayer.new()
+	fade_layer.layer = 20
+	add_child(fade_layer)
+	fade_rect = ColorRect.new()
+	fade_rect.color = Color(0, 0, 0, 0)
+	fade_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	fade_rect.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	fade_layer.add_child(fade_rect)
+
+func _build_banner(root: Control) -> void:
+	banner_panel = PanelContainer.new()
+	banner_panel.visible = false
+	banner_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	banner_panel.anchor_left = 0.5
+	banner_panel.anchor_right = 0.5
+	banner_panel.anchor_top = 0.0
+	banner_panel.anchor_bottom = 0.0
+	banner_panel.offset_left = -200
+	banner_panel.offset_right = 200
+	banner_panel.offset_top = 100
+	banner_panel.offset_bottom = 100
+	banner_panel.grow_vertical = Control.GROW_DIRECTION_END
+	root.add_child(banner_panel)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 6)
+	banner_panel.add_child(box)
+	banner_title = Label.new()
+	banner_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	banner_title.add_theme_font_size_override("font_size", 22)
+	banner_title.add_theme_color_override("font_color", Color(1.0, 0.96, 0.82))
+	box.add_child(banner_title)
+	banner_body = Label.new()
+	banner_body.autowrap_mode = TextServer.AUTOWRAP_WORD
+	banner_body.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	banner_body.custom_minimum_size = Vector2(370, 0)
+	banner_body.add_theme_font_size_override("font_size", 14)
+	banner_body.add_theme_color_override("font_color", Color(1.0, 0.96, 0.82))
+	box.add_child(banner_body)
+	var hint := Label.new()
+	hint.text = "SPACE / ENTER  •  Dismiss"
+	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hint.add_theme_font_size_override("font_size", 11)
+	hint.modulate = Color(1, 1, 1, 0.6)
+	box.add_child(hint)
+
+func _show_banner(title: String, body: String, accent: Color) -> void:
+	banner_title.text = title
+	banner_body.text = body
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0.13, 0.19, 0.14, 0.95)
+	style.border_color = accent
+	style.set_border_width_all(3)
+	style.set_corner_radius_all(6)
+	style.set_content_margin_all(12)
+	banner_panel.add_theme_stylebox_override("panel", style)
+	banner_panel.modulate.a = 0.0
+	banner_panel.visible = true
+	create_tween().tween_property(banner_panel, "modulate:a", 1.0, 0.5)
+	banner_timer = 10.0
+
+func _draw_interior() -> void:
+	draw_rect(Rect2(0, 0, 640, 480), Color("#2b1d14"))
+	# walls + frame
+	draw_rect(Rect2(164, 134, 312, 202), Color("#8e6a46"))
+	draw_rect(Rect2(170, 140, 300, 62), Color("#e0cba2"))
+	draw_rect(Rect2(170, 196, 300, 6), Color("#8e6a46"))
+	# wooden floor
+	draw_rect(Rect2(170, 202, 300, 128), Color("#b07a4a"))
+	for y in range(218, 330, 16):
+		draw_line(Vector2(170, y), Vector2(470, y), Color("#9a6a3e"), 1.0)
+	# window
+	draw_rect(Rect2(226, 150, 48, 36), Color("#6b4a2f"))
+	draw_rect(Rect2(230, 154, 40, 28), Color("#9fd3e6"))
+	draw_line(Vector2(250, 154), Vector2(250, 182), Color("#6b4a2f"), 2.0)
+	draw_line(Vector2(230, 168), Vector2(270, 168), Color("#6b4a2f"), 2.0)
+	# rug
+	draw_rect(Rect2(250, 252, 110, 52), Color("#4d6f96"))
+	draw_rect(Rect2(256, 258, 98, 40), Color("#7aa0c8"))
+	# table with lemons
+	draw_rect(Rect2(184, 204, 44, 26), Color("#7a5038"))
+	draw_circle(Vector2(198, 206), 5, Color("#f5d83f"))
+	draw_circle(Vector2(210, 207), 5, Color("#f5d83f"))
+	# bed
+	draw_rect(Rect2(376, 164, 68, 62), Color("#6b4a2f"))
+	draw_rect(Rect2(381, 170, 58, 50), Color("#efe7d2"))
+	draw_rect(Rect2(381, 190, 58, 30), Color("#c75a54"))
+	draw_rect(Rect2(386, 173, 48, 15), Color("#fffaf0"))
+	# door + mat
+	draw_rect(Rect2(298, 326, 44, 10), Color("#7a5038"))
+	draw_rect(Rect2(300, 310, 40, 12), Color("#8e493c"))
+	# shadow under the player
+	if player:
+		draw_circle(player.position + Vector2(0, 5), 12, Color(0, 0, 0, 0.12))

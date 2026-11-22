@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://523s63l4rid0"]
+
+[ext_resource type="Script" uid="uid://bggchg4rs71jp" path="res://Scripts/farm_game.gd" id="1"]
+
+[node name="BackasaFarm" type="Node2D"]
+script = ExtResource("1")
